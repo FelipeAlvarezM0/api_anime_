@@ -5,11 +5,10 @@ services:
     plan: free
     region: oregon
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "uvicorn sw:app --host 0.0.0.0 --port $PORT"
+    startCommand: "uvicorn api_sw:app --host 0.0.0.0 --port $PORT"
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
-      # Opcional: forzar dominio y UA por si AnimeFLV cambia / bloquea
       - key: BASE_CANDIDATES
         value: "https://www3.animeflv.net,https://www2.animeflv.net,https://www.animeflv.net"
       - key: SCRAPER_UA

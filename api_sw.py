@@ -3,17 +3,10 @@
 # FastAPI que permite:
 #   1) /search?q=...                       -> buscar series
 #   2) /anime/{slug}/episodes              -> listar episodios
-#   3) /anime/{slug}/episode/{id}/videos   -> obtener "var videos"
-#      (exactamente los enlaces que ves en la página: code/url)
+#   3) /anime/{slug}/episode/{id}/videos   -> obtener "var videos" (code/url)
 #
-# Requisitos:
-#   pip install fastapi "uvicorn[standard]" animeflv requests pydantic
-#
-# Correr localmente:
+# Correr local:
 #   python -m uvicorn api_sw:app --reload
-#
-# Deploy en Render:
-#   startCommand: "uvicorn api_sw:app --host 0.0.0.0 --port $PORT"
 # ------------------------------------------------------------
 
 import os
@@ -29,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from animeflv import AnimeFLV
 
-# ------------ Config scraping (soporta env vars) ------------
+# ------------ Config scraping (env vars soportadas) ------------
 BASE_CANDIDATES = list(
     filter(None, [x.strip() for x in os.getenv("BASE_CANDIDATES", "").split(",")])
 ) or [
@@ -56,12 +49,10 @@ class SeriesItem(BaseModel):
     poster: Optional[str] = None
     synopsis: Optional[str] = None
 
-
 class EpisodeItem(BaseModel):
     id: int
     number: int
     title: str
-
 
 class VideoItem(BaseModel):
     track: Literal["SUB", "LAT"]
@@ -70,7 +61,6 @@ class VideoItem(BaseModel):
     code: Optional[str] = None
     url: Optional[str] = None
 
-
 class VideosResponse(BaseModel):
     page_url: str
     anime_id: Optional[str] = None
@@ -78,15 +68,11 @@ class VideosResponse(BaseModel):
     episode_number: Optional[str] = None
     items: List[VideoItem]
 
-
 # ------------ App ------------
 app = FastAPI(
     title="Anime API (videos embebidos)",
     version="2.1.0",
-    description=(
-        "API para buscar series, listar episodios y obtener los enlaces de "
-        "'var videos' (code/url) tal como aparecen en la página AnimeFLV."
-    ),
+    description="API para buscar series, listar episodios y obtener enlaces de 'var videos' tal como aparecen en AnimeFLV."
 )
 
 app.add_middleware(
@@ -159,15 +145,13 @@ def flatten_videos(videos: dict) -> List[VideoItem]:
         if not isinstance(items, list):
             continue
         for it in items:
-            out.append(
-                VideoItem(
-                    track=track,  # type: ignore
-                    server=(it.get("server") or "").lower(),
-                    title=it.get("title"),
-                    code=(it.get("code") or "").replace("\\/", "/") or None,
-                    url=(it.get("url") or "").replace("\\/", "/") or None,
-                )
-            )
+            out.append(VideoItem(
+                track=track,  # type: ignore
+                server=(it.get("server") or "").lower(),
+                title=it.get("title"),
+                code=(it.get("code") or "").replace("\\/", "/") or None,
+                url=(it.get("url") or "").replace("\\/", "/") or None,
+            ))
     return out
 
 PREFERRED = ("sw", "streamwish", "sb", "streamsb", "sbplay", "stape", "okru", "uqload", "mega")
@@ -206,18 +190,14 @@ def get_episodes(anime_id: str):
         if anime_id.isdigit():
             raise HTTPException(
                 status_code=400,
-                detail="anime_id inválido. Debe ser el slug devuelto por /search (ej: 'dragon-ball-daima').",
+                detail="anime_id inválido. Debe ser el slug devuelto por /search (ej: 'dragon-ball-daima')."
             )
         with with_api() as api:
             info = retry(lambda: api.get_anime_info(anime_id))
             eps = list(info.episodes or [])
             eps.sort(key=lambda x: x.id)
             return [
-                EpisodeItem(
-                    id=ep.id,
-                    number=ep.id,
-                    title=(getattr(ep, "title", None) or f"Episodio {ep.id}"),
-                )
+                EpisodeItem(id=ep.id, number=ep.id, title=(getattr(ep, "title", None) or f"Episodio {ep.id}"))
                 for ep in eps
             ]
     except HTTPException:
@@ -236,7 +216,7 @@ def get_episode_videos(
         if anime_id.isdigit():
             raise HTTPException(
                 status_code=400,
-                detail="anime_id inválido. Debe ser el slug devuelto por /search (ej: 'dragon-ball-daima').",
+                detail="anime_id inválido. Debe ser el slug devuelto por /search (ej: 'dragon-ball-daima')."
             )
         page_html, page_url = fetch_episode_html(anime_id, episode_id)
         videos = extract_videos_dict(page_html)
