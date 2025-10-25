@@ -4,6 +4,9 @@
 #   1) /search?q=...                       -> buscar series
 #   2) /anime/{slug}/episodes              -> listar episodios
 #   3) /anime/{slug}/episode/{id}/videos   -> obtener "var videos" (code/url)
+#   4) /catalog                            -> listar catálogo (slug + título)
+#   5) /slugs                              -> lista solo slugs
+#   6) /resolve?title=...                  -> resolver título humano a slug
 #
 # Correr local:
 #   python -m uvicorn api_sw:app --reload
@@ -15,6 +18,8 @@ import html
 import json
 import time
 import requests
+import difflib
+from functools import lru_cache
 from typing import List, Optional, Literal
 
 from fastapi import FastAPI, HTTPException, Query
@@ -71,8 +76,11 @@ class VideosResponse(BaseModel):
 # ------------ App ------------
 app = FastAPI(
     title="Anime API (videos embebidos)",
-    version="2.1.0",
-    description="API para buscar series, listar episodios y obtener enlaces de 'var videos' tal como aparecen en AnimeFLV."
+    version="2.2.0",
+    description=(
+        "API para buscar series, listar episodios y obtener enlaces de 'var videos' tal como aparecen en AnimeFLV. "
+        "Incluye catálogo de slugs y resolver de títulos."
+    )
 )
 
 app.add_middleware(
@@ -166,6 +174,122 @@ def pick_best(items: List[VideoItem]) -> Optional[VideoItem]:
     items_sorted = sorted(items, key=lambda it: (pref_index(it.server), 0 if it.code else 1))
     return items_sorted[0] if items_sorted else None
 
+# ------------ Catalog scraping (slugs + títulos) ------------
+# /browse ordenado por título y paginado: ?order=title&page=N
+BROWSE_PATH = "/browse?order=title&page={page}"
+
+# Regex: <a href="/anime/{slug}" ... title="{Title}">
+CAT_ITEM_RE = re.compile(
+    r'href="(?:https?://[^/]+)?/anime/([^"]+)"[^>]*title="([^"]+)"',
+    re.IGNORECASE
+)
+
+def fetch_catalog_page(page: int, base: Optional[str] = None) -> list[tuple[str, str]]:
+    """Devuelve [(slug, title), ...] para una página del browse."""
+    bases = [base] if base else BASE_CANDIDATES
+    last_err = None
+    for b in bases:
+        url = f"{b}{BROWSE_PATH.format(page=page)}"
+        try:
+            text = http_get(url, timeout=25).text
+            items = CAT_ITEM_RE.findall(text)
+            out = []
+            for slug, title in items:
+                out.append((slug.strip(), html.unescape(title).strip()))
+            return out
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"No se pudo cargar browse page={page}. Último error: {last_err}")
+
+def crawl_catalog(start_page: int = 1, max_pages: int = 50, sleep_sec: float = 0.0) -> list[dict]:
+    """
+    Recorre páginas consecutivas del browse hasta:
+      - llegar a max_pages, o
+      - que una página no traiga resultados (fin).
+    Devuelve [{id: slug, title: str}, ...] sin duplicados.
+    """
+    seen = set()
+    out: list[dict] = []
+    for p in range(start_page, start_page + max_pages):
+        items = fetch_catalog_page(p)
+        if not items:
+            break
+        added = 0
+        for slug, title in items:
+            if slug and slug not in seen:
+                seen.add(slug)
+                out.append({"id": slug, "title": title})
+                added += 1
+        if added == 0:
+            break
+        if sleep_sec:
+            time.sleep(sleep_sec)
+    return out
+
+# ---------- Cache en memoria + archivo opcional ----------
+CATALOG_CACHE: list[dict] = []
+CATALOG_CACHE_TS: float = 0.0
+CATALOG_TTL_SEC = int(os.getenv("CATALOG_TTL_SEC", "21600"))  # 6h por defecto
+CATALOG_JSON_PATH = os.getenv("CATALOG_JSON_PATH", "")
+
+def _load_catalog_from_disk() -> list[dict]:
+    if not CATALOG_JSON_PATH or not os.path.exists(CATALOG_JSON_PATH):
+        return []
+    try:
+        with open(CATALOG_JSON_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict) and "id" in x and "title" in x]
+    except Exception:
+        pass
+    return []
+
+def _save_catalog_to_disk(items: list[dict]) -> None:
+    if not CATALOG_JSON_PATH:
+        return
+    try:
+        with open(CATALOG_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+def get_cached_catalog(force_refresh: bool = False) -> list[dict]:
+    global CATALOG_CACHE, CATALOG_CACHE_TS
+    now = time.time()
+    if (not force_refresh) and CATALOG_CACHE and (now - CATALOG_CACHE_TS) < CATALOG_TTL_SEC:
+        return CATALOG_CACHE
+    # intenta disco
+    if not force_refresh and not CATALOG_CACHE:
+        disk_items = _load_catalog_from_disk()
+        if disk_items:
+            CATALOG_CACHE = disk_items
+            CATALOG_CACHE_TS = now
+            return CATALOG_CACHE
+    # refresca raspando
+    items = crawl_catalog(start_page=1, max_pages=int(os.getenv("CATALOG_MAX_PAGES", "80")), sleep_sec=0.15)
+    CATALOG_CACHE = items
+    CATALOG_CACHE_TS = now
+    _save_catalog_to_disk(items)
+    return CATALOG_CACHE
+
+@lru_cache(maxsize=1)
+def get_slug_set() -> set[str]:
+    return set(x["id"] for x in get_cached_catalog(force_refresh=False))
+
+def fuzzy_resolve_title(title: str, cutoff: float = 0.6) -> Optional[dict]:
+    """Intenta emparejar por título; devuelve {id, title} o None."""
+    items = get_cached_catalog(force_refresh=False)
+    titles = [x["title"] for x in items]
+    match = difflib.get_close_matches(title, titles, n=1, cutoff=cutoff)
+    if not match:
+        return None
+    best_title = match[0]
+    for x in items:
+        if x["title"] == best_title:
+            return x
+    return None
+
 # ------------ Endpoints ------------
 @app.get("/search", response_model=List[SeriesItem])
 def search_series(q: str = Query(..., min_length=1, description="Nombre del anime a buscar")):
@@ -244,6 +368,53 @@ def get_episode_videos(
         raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"No se pudieron obtener los enlaces: {e}")
+
+# ------------ Endpoints de catálogo/slug ------------
+@app.get("/catalog", response_model=List[SeriesItem])
+def list_catalog(
+    refresh: bool = Query(False, description="Si true, fuerza recrawl/refresh del catálogo"),
+    start_page: int = Query(1, ge=1),
+    max_pages: int = Query(0, ge=0, description="Si >0, ignora cache y recorre N páginas desde start_page")
+):
+    """
+    Devuelve el catálogo en forma [{id: slug, title, poster=None, synopsis=None}, ...].
+    Si max_pages>0, hace crawl ad-hoc sin tocar la caché global (útil para pruebas).
+    """
+    try:
+        if max_pages > 0:
+            raw = crawl_catalog(start_page=start_page, max_pages=max_pages, sleep_sec=0.15)
+        else:
+            raw = get_cached_catalog(force_refresh=refresh)
+        return [SeriesItem(id=x["id"], title=x["title"]) for x in raw]
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"No se pudo obtener el catálogo: {e}")
+
+@app.get("/slugs", response_model=List[str])
+def list_slugs():
+    """Solo devuelve la lista de slugs válidos."""
+    try:
+        return [x["id"] for x in get_cached_catalog(force_refresh=False)]
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"No se pudo obtener slugs: {e}")
+
+@app.get("/resolve")
+def resolve_title_to_slug(
+    title: str = Query(..., min_length=2, description="Título aproximado a resolver a slug"),
+    cutoff: float = Query(0.6, ge=0.0, le=1.0)
+):
+    """
+    Devuelve {"id": slug, "title": title} para un título aproximado.
+    Útil cuando tenés el nombre humano y querés el identificador que usan tus endpoints.
+    """
+    try:
+        match = fuzzy_resolve_title(title, cutoff=cutoff)
+        if not match:
+            raise HTTPException(status_code=404, detail="No se encontró un slug probable para ese título.")
+        return match
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al resolver título: {e}")
 
 # ------------ Main ------------
 if __name__ == "__main__":
